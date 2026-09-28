@@ -1,3 +1,4 @@
+import path from 'node:path';
 import chromium from '@sparticuz/chromium';
 import puppeteer from 'puppeteer-core';
 
@@ -20,10 +21,23 @@ export default async function handler(req, res) {
     const fileId = pathSegments.length >= 2 ? pathSegments[pathSegments.length - 2] : (pathSegments[0] || "unknown");
     const rawFallbackName = pathSegments.length > 0 ? decodeURIComponent(pathSegments[pathSegments.length - 1]) : "unknown";
 
+    if (typeof chromium.setGraphicsMode === 'function') {
+      chromium.setGraphicsMode(false);
+    }
+
+    const executablePath = await chromium.executablePath();
+    process.env.LD_LIBRARY_PATH = `${path.dirname(executablePath)}:${process.env.LD_LIBRARY_PATH || ''}`;
+
     browser = await puppeteer.launch({
-      args: [...chromium.args, '--disable-gpu', '--no-sandbox'],
+      args: [
+        ...chromium.args,
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ],
       defaultViewport: chromium.defaultViewport,
-      executablePath: await chromium.executablePath(),
+      executablePath: executablePath,
       headless: chromium.headless
     });
 
