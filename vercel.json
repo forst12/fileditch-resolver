@@ -1,7 +1,8 @@
 {
   "functions": {
     "api/resolve.js": {
-      "maxDuration": 45
+      "maxDuration": 45,
+      "includeFiles": "node_modules/@sparticuz/chromium/bin/**"
     }
   }
 }
