@@ -1,9 +1,9 @@
 {
   "name": "fileditch-resolver",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "dependencies": {
-    "@sparticuz/chromium": "latest",
-    "puppeteer-core": "latest"
+    "@sparticuz/chromium-min": "153.0.0",
+    "puppeteer-core": "23.6.0"
   }
 }
