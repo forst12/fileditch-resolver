@@ -4,8 +4,10 @@ import puppeteer from 'puppeteer-core';
 export const maxDuration = 45;
 
 export default async function handler(req, res) {
-  const targetUrl = req.query.link || req.query.url;
+  const startTime = Date.now();
+  console.log('[RESOLVER] 1. Request received at', new Date().toISOString());
 
+  const targetUrl = req.query.link || req.query.url;
   if (!targetUrl) {
     return res.status(400).json({
       statusCode: 400,
@@ -14,14 +16,29 @@ export default async function handler(req, res) {
   }
 
   let browser = null;
+  const safeClose = async (b) => {
+    if (!b) return;
+    try {
+      await Promise.race([b.close(), new Promise(r => setTimeout(r, 1000))]);
+    } catch (e) {}
+    try {
+      if (b.process()) b.process().kill('SIGKILL');
+    } catch (e) {}
+  };
+
   try {
     const parsedUrl = new URL(targetUrl);
     const pathSegments = parsedUrl.pathname.split('/').filter(Boolean);
     const fileId = pathSegments.length >= 2 ? pathSegments[pathSegments.length - 2] : (pathSegments[0] || "unknown");
     const rawFallbackName = pathSegments.length > 0 ? decodeURIComponent(pathSegments[pathSegments.length - 1]) : "unknown";
 
+    console.log('[RESOLVER] 2. Extracting chromium executable...');
+    const t0 = Date.now();
     const executablePath = await chromium.executablePath();
+    console.log('[RESOLVER] 2. Executable ready in ' + (Date.now() - t0) + 'ms:', executablePath);
 
+    console.log('[RESOLVER] 3. Launching browser...');
+    const tLaunch = Date.now();
     browser = await puppeteer.launch({
       args: [
         ...chromium.args,
@@ -34,9 +51,20 @@ export default async function handler(req, res) {
       executablePath: executablePath,
       headless: chromium.headless
     });
+    console.log('[RESOLVER] 3. Browser launched in ' + (Date.now() - tLaunch) + 'ms');
 
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36');
+
+    // Attach request/response and console diagnostics
+    page.on('console', msg => console.log('[PAGE]', msg.text()));
+    page.on('pageerror', err => console.log('[PAGE ERR]', err.message));
+    page.on('response', resp => {
+      const u = resp.url();
+      if (u.includes('fileditch') || u.includes('challenge-platform')) {
+        console.log('[HTTP ' + resp.status() + ']', u.slice(0, 70));
+      }
+    });
 
     // Emulate authentic Windows client environment for PoW verification
     await page.evaluateOnNewDocument(() => {
@@ -53,22 +81,29 @@ export default async function handler(req, res) {
       };
     });
 
+    console.log('[RESOLVER] 4. Navigating to ' + targetUrl + '...');
+    const tNav = Date.now();
     await page.goto(targetUrl, { 
       waitUntil: 'domcontentloaded', 
-      timeout: 20000 
+      timeout: 15000 
     });
+    console.log('[RESOLVER] 4. Navigated in ' + (Date.now() - tNav) + 'ms');
 
     let directLink = null;
     let filename = null;
     let size = null;
+    let errorDetected = null;
 
-    const startTime = Date.now();
-    while (Date.now() - startTime < 18000) {
+    console.log('[RESOLVER] 5. Polling for resolution (max 15s)...');
+    const pollStart = Date.now();
+    while (Date.now() - pollStart < 15000) {
       try {
         const data = await page.evaluate(() => {
           const btn = document.querySelector('.btn-main, a[download]');
           const pathEl = document.querySelector('.pathline .path, h1, .filename');
           const sizeEl = document.querySelector('.pathline .size, .filesize');
+          const errEl = document.querySelector('.error-badge');
+
           if (btn && btn.href && btn.href.startsWith('http') && !btn.href.startsWith('javascript:')) {
             return {
               directLink: btn.href,
@@ -76,6 +111,11 @@ export default async function handler(req, res) {
               size: sizeEl ? sizeEl.innerText.trim() : null
             };
           }
+
+          if (errEl) {
+            return { errorBadge: errEl.innerText };
+          }
+
           return null;
         });
 
@@ -83,7 +123,13 @@ export default async function handler(req, res) {
           directLink = data.directLink;
           filename = data.filename;
           size = data.size;
+          console.log('[RESOLVER] Direct link resolved in ' + (Date.now() - pollStart) + 'ms!');
           break;
+        }
+
+        if (data && data.errorBadge) {
+          errorDetected = data.errorBadge;
+          console.log('[RESOLVER] Error badge detected:', errorDetected);
         }
       } catch (navErr) {
         // Navigation or context switch in progress; continue polling
@@ -102,7 +148,8 @@ export default async function handler(req, res) {
         };
       }).catch(e => ({ title: 'unknown', url: 'unknown', btnHref: 'unknown', text: e.message }));
 
-      await browser.close();
+      console.log('[RESOLVER] Failed within timeout. Page state:', JSON.stringify(pageInfo));
+      await safeClose(browser);
       browser = null;
 
       return res.status(502).json({
@@ -111,9 +158,10 @@ export default async function handler(req, res) {
       });
     }
 
-    await browser.close();
+    await safeClose(browser);
     browser = null;
 
+    console.log('[RESOLVER] Returning success in ' + (Date.now() - startTime) + 'ms');
     return res.status(200).json({
       statusCode: 200,
       id: fileId,
@@ -123,11 +171,8 @@ export default async function handler(req, res) {
     });
 
   } catch (err) {
-    if (browser) {
-      try {
-        await browser.close();
-      } catch (e) {}
-    }
+    console.error('[RESOLVER ERR]', err);
+    if (browser) await safeClose(browser);
     return res.status(500).json({
       statusCode: 500,
       error: err.message
