@@ -2,7 +2,7 @@
   "functions": {
     "api/resolve.js": {
       "maxDuration": 45,
-      "includeFiles": "node_modules/@sparticuz/chromium/bin/**"
+      "includeFiles": "{node_modules/@sparticuz/chromium/bin/**,node_modules/puppeteer-extra*/**}"
     }
   }
 }
