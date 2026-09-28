@@ -1,8 +1,7 @@
 {
   "functions": {
     "api/resolve.js": {
-      "memory": 1024,
-      "maxDuration": 30
+      "maxDuration": 45
     }
   }
 }
