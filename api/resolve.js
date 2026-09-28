@@ -1,8 +1,7 @@
-import path from 'node:path';
-import chromium from '@sparticuz/chromium';
+import chromium from '@sparticuz/chromium-min';
 import puppeteer from 'puppeteer-core';
 
-export const maxDuration = 30;
+export const maxDuration = 45;
 
 export default async function handler(req, res) {
   const targetUrl = req.query.link || req.query.url;
@@ -25,8 +24,9 @@ export default async function handler(req, res) {
       chromium.setGraphicsMode(false);
     }
 
-    const executablePath = await chromium.executablePath();
-    process.env.LD_LIBRARY_PATH = `${path.dirname(executablePath)}:${process.env.LD_LIBRARY_PATH || ''}`;
+    const executablePath = await chromium.executablePath(
+      'https://github.com/Sparticuz/chromium/releases/download/v153.0.0/chromium-v153.0.0-pack.x64.tar'
+    );
 
     browser = await puppeteer.launch({
       args: [
@@ -46,10 +46,10 @@ export default async function handler(req, res) {
 
     await page.goto(targetUrl, { 
       waitUntil: 'domcontentloaded', 
-      timeout: 20000 
+      timeout: 25000 
     });
 
-    await page.waitForSelector('.btn-main, a[download]', { timeout: 15000 });
+    await page.waitForSelector('.btn-main, a[download]', { timeout: 20000 });
 
     const pageData = await page.evaluate(() => {
       const btn = document.querySelector('.btn-main, a[download]');
