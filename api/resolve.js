@@ -1,4 +1,4 @@
-import chromium from '@sparticuz/chromium-min';
+import chromium from '@sparticuz/chromium';
 import puppeteer from 'puppeteer-core';
 
 export const maxDuration = 45;
@@ -20,9 +20,8 @@ export default async function handler(req, res) {
     const fileId = pathSegments.length >= 2 ? pathSegments[pathSegments.length - 2] : (pathSegments[0] || "unknown");
     const rawFallbackName = pathSegments.length > 0 ? decodeURIComponent(pathSegments[pathSegments.length - 1]) : "unknown";
 
-    const executablePath = await chromium.executablePath(
-      'https://github.com/Sparticuz/chromium/releases/download/v153.0.0/chromium-v153.0.0-pack.x64.tar'
-    );
+    // Extract bundled AL2023 chromium locally from node_modules in ~500ms
+    const executablePath = await chromium.executablePath();
 
     browser = await puppeteer.launch({
       args: [
