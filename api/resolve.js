@@ -20,10 +20,6 @@ export default async function handler(req, res) {
     const fileId = pathSegments.length >= 2 ? pathSegments[pathSegments.length - 2] : (pathSegments[0] || "unknown");
     const rawFallbackName = pathSegments.length > 0 ? decodeURIComponent(pathSegments[pathSegments.length - 1]) : "unknown";
 
-    if (typeof chromium.setGraphicsMode === 'function') {
-      chromium.setGraphicsMode(false);
-    }
-
     const executablePath = await chromium.executablePath(
       'https://github.com/Sparticuz/chromium/releases/download/v153.0.0/chromium-v153.0.0-pack.x64.tar'
     );
@@ -34,9 +30,9 @@ export default async function handler(req, res) {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu'
+        '--disable-blink-features=AutomationControlled'
       ],
-      defaultViewport: chromium.defaultViewport,
+      defaultViewport: { width: 1280, height: 800 },
       executablePath: executablePath,
       headless: chromium.headless
     });
@@ -44,44 +40,82 @@ export default async function handler(req, res) {
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36');
 
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
     await page.goto(targetUrl, { 
       waitUntil: 'domcontentloaded', 
       timeout: 25000 
     });
 
-    await page.waitForSelector('.btn-main, a[download]', { timeout: 20000 });
+    let directLink = null;
+    let filename = null;
+    let size = null;
 
-    const pageData = await page.evaluate(() => {
-      const btn = document.querySelector('.btn-main, a[download]');
-      const pathEl = document.querySelector('.pathline .path');
-      const sizeEl = document.querySelector('.pathline .size');
+    const startTime = Date.now();
+    while (Date.now() - startTime < 30000) {
+      try {
+        const data = await page.evaluate(() => {
+          const btn = document.querySelector('.btn-main, a[download]');
+          const pathEl = document.querySelector('.pathline .path, h1, .filename');
+          const sizeEl = document.querySelector('.pathline .size, .filesize');
+          if (btn && btn.href && btn.href.startsWith('http') && !btn.href.startsWith('javascript:')) {
+            return {
+              directLink: btn.href,
+              filename: pathEl ? pathEl.innerText.trim() : null,
+              size: sizeEl ? sizeEl.innerText.trim() : null
+            };
+          }
+          return null;
+        });
 
-      return {
-        directLink: btn ? btn.href : null,
-        filename: pathEl ? pathEl.innerText.trim() : null,
-        size: sizeEl ? sizeEl.innerText.trim() : null
-      };
-    });
+        if (data && data.directLink) {
+          directLink = data.directLink;
+          filename = data.filename;
+          size = data.size;
+          break;
+        }
+      } catch (navErr) {
+        // Navigation or context switch in progress; continue polling
+      }
+      await new Promise(r => setTimeout(r, 400));
+    }
 
-    await browser.close();
+    if (!directLink) {
+      const pageInfo = await page.evaluate(() => {
+        return {
+          title: document.title,
+          text: document.body ? document.body.innerText.slice(0, 400) : ''
+        };
+      }).catch(() => ({ title: 'unknown', text: 'eval failed' }));
 
-    if (!pageData.directLink || pageData.directLink.startsWith('javascript:')) {
+      await browser.close();
+      browser = null;
+
       return res.status(502).json({
         statusCode: 502,
-        error: "Failed to resolve direct link (PoW verification failed)"
+        error: `Failed to resolve direct link within 30s. Title: "${pageInfo.title}", Text: "${pageInfo.text.replace(/\n+/g, ' ')}"`
       });
     }
+
+    await browser.close();
+    browser = null;
 
     return res.status(200).json({
       statusCode: 200,
       id: fileId,
-      filename: pageData.filename || rawFallbackName,
-      size: pageData.size || "Unknown",
-      directLink: pageData.directLink.replace(/&amp;/g, '&')
+      filename: filename || rawFallbackName,
+      size: size || "Unknown",
+      directLink: directLink.replace(/&amp;/g, '&')
     });
 
   } catch (err) {
-    if (browser) await browser.close().catch(() => {});
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (e) {}
+    }
     return res.status(500).json({
       statusCode: 500,
       error: err.message
