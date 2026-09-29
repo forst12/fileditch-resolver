@@ -99,15 +99,24 @@ export default async function handler(req, res) {
     });
     console.log('[RESOLVER] 2. Navigated in ' + (Date.now() - tNav) + 'ms');
 
+    // Helper to evaluate with strict timeout to prevent Puppeteer hanging on navigating contexts
+    const evalWithTimeout = (fn, timeoutMs = 1500) => {
+      return Promise.race([
+        page.evaluate(fn),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('eval_timeout')), timeoutMs))
+      ]);
+    };
+
     let directLink = null;
     let filename = null;
     let size = null;
+    let lastErrorBadge = null;
 
-    console.log('[RESOLVER] 3. Polling for resolution (100ms interval)...');
+    console.log('[RESOLVER] 3. Polling for resolution (100ms interval, protected eval)...');
     const pollStart = Date.now();
     while (Date.now() - pollStart < 25000) {
       try {
-        const data = await page.evaluate(() => {
+        const data = await evalWithTimeout(() => {
           const btn = document.querySelector('.btn-main, a[download]');
           const pathEl = document.querySelector('.pathline .path, h1, .filename');
           const sizeEl = document.querySelector('.pathline .size, .filesize');
@@ -120,8 +129,13 @@ export default async function handler(req, res) {
               size: sizeEl ? sizeEl.innerText.trim() : null
             };
           }
+
+          if (errEl && errEl.innerText) {
+            return { errorBadge: errEl.innerText.trim() };
+          }
+
           return null;
-        });
+        }, 1200);
 
         if (data && data.directLink) {
           directLink = data.directLink;
@@ -130,14 +144,18 @@ export default async function handler(req, res) {
           console.log('[RESOLVER] Direct link resolved in ' + (Date.now() - pollStart) + 'ms!');
           break;
         }
+
+        if (data && data.errorBadge) {
+          lastErrorBadge = data.errorBadge;
+        }
       } catch (navErr) {
-        // Navigation or context switch in progress; continue polling
+        // Navigation in progress or eval_timeout; continue polling safely
       }
       await new Promise(r => setTimeout(r, 100));
     }
 
     if (!directLink) {
-      const pageInfo = await page.evaluate(() => {
+      const pageInfo = await evalWithTimeout(() => {
         const btn = document.querySelector('.btn-main, a[download]');
         return {
           title: document.title,
@@ -145,15 +163,15 @@ export default async function handler(req, res) {
           btnHref: btn ? btn.href : 'no btn',
           text: document.body ? document.body.innerText.slice(0, 300) : ''
         };
-      }).catch(e => ({ title: 'unknown', url: 'unknown', btnHref: 'unknown', text: e.message }));
+      }, 1500).catch(e => ({ title: 'unknown', url: 'unknown', btnHref: 'unknown', text: e.message }));
 
-      console.log('[RESOLVER] Failed within timeout. Page state:', JSON.stringify(pageInfo));
+      console.log('[RESOLVER] Failed within timeout. Page state:', JSON.stringify(pageInfo), 'Last badge:', lastErrorBadge);
       await safeClose(browser);
       browser = null;
 
       return res.status(502).json({
         statusCode: 502,
-        error: "PoW wait timeout. Title: " + pageInfo.title + ", Url: " + pageInfo.url + ", Btn: " + pageInfo.btnHref + ", Text: " + pageInfo.text.replace(/\n+/g, ' ')
+        error: "PoW wait timeout (max 25s). State: " + (lastErrorBadge || pageInfo.text.replace(/\n+/g, ' ') || pageInfo.title)
       });
     }
 
