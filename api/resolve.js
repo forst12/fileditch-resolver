@@ -21,13 +21,14 @@ export default async function handler(req, res) {
   }
 
   let browser = null;
-  const safeClose = async (b) => {
+  const fastClose = (b) => {
     if (!b) return;
     try {
-      await Promise.race([b.close(), new Promise(r => setTimeout(r, 1000))]);
+      const p = b.process();
+      if (p) p.kill('SIGKILL');
     } catch (e) {}
     try {
-      if (b.process()) b.process().kill('SIGKILL');
+      b.close().catch(() => {});
     } catch (e) {}
   };
 
@@ -44,13 +45,21 @@ export default async function handler(req, res) {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
         '--disable-blink-features=AutomationControlled',
         '--disable-extensions',
         '--disable-background-networking',
         '--disable-default-apps',
         '--disable-sync',
         '--mute-audio',
-        '--no-first-run'
+        '--no-first-run',
+        '--disable-renderer-backgrounding',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-ipc-flooding-protection',
+        '--disable-breakpad',
+        '--disable-component-update',
+        '--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints'
       ],
       defaultViewport: { width: 1280, height: 800 },
       executablePath: executablePath,
@@ -61,34 +70,95 @@ export default async function handler(req, res) {
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36');
 
     page.on('console', msg => console.log('[PAGE]', msg.text()));
-    page.on('response', resp => {
+
+    let resolvedData = null;
+    let initialTitle = null;
+
+    const parseAndSetResult = (html, source) => {
+      if (resolvedData || !html) return false;
+      const b64Match = html.match(/atob\(\s*["'](aHR0cHM6[^"']+)["']\s*\)/);
+      if (!b64Match) return false;
+
+      const cleanB64 = b64Match[1].replace(/\\/g, '');
+      let link = null;
+      try {
+        link = Buffer.from(cleanB64, 'base64').toString('utf8');
+      } catch (e) {
+        return false;
+      }
+
+      if (!link || !link.startsWith('http')) return false;
+
+      const pathMatch = html.match(/class=["']path["'][^>]*>([^<]+)<\//i);
+      const sizeMatch = html.match(/class=["']size["'][^>]*>([^<]+)<\//i);
+
+      resolvedData = {
+        directLink: link.replace(/&amp;/g, '&'),
+        filename: pathMatch ? pathMatch[1].trim() : (initialTitle || rawFallbackName),
+        size: sizeMatch ? sizeMatch[1].trim() : "Unknown"
+      };
+      console.log(`[RESOLVER] Direct link intercepted via ${source} in ${Date.now() - startTime}ms!`);
+      return true;
+    };
+
+    // Attach response listeners
+    page.on('response', async (resp) => {
       const u = resp.url();
       if (u.includes('fileditch') || u.includes('challenge-platform')) {
         console.log('[HTTP ' + resp.status() + ']', u.slice(0, 70));
       }
+      if (!resolvedData && resp.status() === 200 && u.includes(fileId) && resp.request().method() === 'POST') {
+        try {
+          const body = await resp.text();
+          parseAndSetResult(body, 'PUPPETEER_POST');
+        } catch (e) {}
+      }
     });
 
-    // Natively block heavy fonts, images, media, and third-party trackers via CDP
+    // Native CDP setup: block unnecessary assets and listen to Network events
     try {
       const cdp = await page.createCDPSession();
+      await cdp.send('Network.enable');
       await cdp.send('Network.setBlockedURLs', {
         urls: [
           '*.woff*',
+          '*.woff2*',
           '*.ttf*',
           '*.otf*',
+          '*.eot*',
           '*.png*',
           '*.jpg*',
           '*.jpeg*',
           '*.gif*',
           '*.webp*',
+          '*.svg*',
+          '*.ico*',
           '*.mp4*',
           '*.webm*',
+          '*.mp3*',
+          '*.wav*',
           '*beacon.min.js*',
-          '*tag.min.js*'
+          '*tag.min.js*',
+          '*/js/render.js*',
+          '*fonts.googleapis.com*',
+          '*fonts.gstatic.com*',
+          '*cdn-cgi/rum?*',
+          '*cdn.plyr.io*'
         ]
       });
+
+      cdp.on('Network.responseReceived', async (params) => {
+        const { response, requestId } = params;
+        if (!resolvedData && response.status === 200 && response.url.includes(fileId)) {
+          try {
+            const res = await cdp.send('Network.getResponseBody', { requestId });
+            const html = res.base64Encoded ? Buffer.from(res.body, 'base64').toString('utf8') : res.body;
+            if (html) parseAndSetResult(html, 'CDP_RESPONSE');
+          } catch (e) {}
+        }
+      });
     } catch (e) {
-      console.log('[RESOLVER] CDP block warning:', e.message);
+      console.log('[RESOLVER] CDP setup warning:', e.message);
     }
 
     console.log('[RESOLVER] 2. Navigating to ' + targetUrl + '...');
@@ -99,22 +169,28 @@ export default async function handler(req, res) {
     });
     console.log('[RESOLVER] 2. Navigated in ' + (Date.now() - tNav) + 'ms');
 
-    // Helper to evaluate with strict timeout to prevent Puppeteer hanging on navigating contexts
-    const evalWithTimeout = (fn, timeoutMs = 1500) => {
+    try {
+      const t = await page.title();
+      if (t && !t.includes('FileDitch') && !t.includes('Just a moment')) {
+        initialTitle = t.trim();
+      }
+    } catch (e) {}
+
+    // Safe evaluate helper
+    const evalWithTimeout = (fn, timeoutMs = 1200) => {
       return Promise.race([
         page.evaluate(fn),
         new Promise((_, reject) => setTimeout(() => reject(new Error('eval_timeout')), timeoutMs))
       ]);
     };
 
-    let directLink = null;
-    let filename = null;
-    let size = null;
     let lastErrorBadge = null;
-
-    console.log('[RESOLVER] 3. Polling for resolution (100ms interval, protected eval)...');
+    console.log('[RESOLVER] 3. Waiting for resolution...');
     const pollStart = Date.now();
+
     while (Date.now() - pollStart < 25000) {
+      if (resolvedData) break;
+
       try {
         const data = await evalWithTimeout(() => {
           const btn = document.querySelector('.btn-main, a[download]');
@@ -135,26 +211,27 @@ export default async function handler(req, res) {
           }
 
           return null;
-        }, 1200);
+        }, 1000);
 
         if (data && data.directLink) {
-          directLink = data.directLink;
-          filename = data.filename;
-          size = data.size;
-          console.log('[RESOLVER] Direct link resolved in ' + (Date.now() - pollStart) + 'ms!');
+          resolvedData = {
+            directLink: data.directLink.replace(/&amp;/g, '&'),
+            filename: data.filename || initialTitle || rawFallbackName,
+            size: data.size || "Unknown"
+          };
+          console.log('[RESOLVER] Direct link resolved via DOM eval in ' + (Date.now() - pollStart) + 'ms!');
           break;
         }
 
         if (data && data.errorBadge) {
           lastErrorBadge = data.errorBadge;
         }
-      } catch (navErr) {
-        // Navigation in progress or eval_timeout; continue polling safely
-      }
-      await new Promise(r => setTimeout(r, 100));
+      } catch (navErr) {}
+
+      await new Promise(r => setTimeout(r, 60));
     }
 
-    if (!directLink) {
+    if (!resolvedData) {
       const pageInfo = await evalWithTimeout(() => {
         const btn = document.querySelector('.btn-main, a[download]');
         return {
@@ -166,7 +243,7 @@ export default async function handler(req, res) {
       }, 1500).catch(e => ({ title: 'unknown', url: 'unknown', btnHref: 'unknown', text: e.message }));
 
       console.log('[RESOLVER] Failed within timeout. Page state:', JSON.stringify(pageInfo), 'Last badge:', lastErrorBadge);
-      await safeClose(browser);
+      fastClose(browser);
       browser = null;
 
       return res.status(502).json({
@@ -175,21 +252,21 @@ export default async function handler(req, res) {
       });
     }
 
-    await safeClose(browser);
+    fastClose(browser);
     browser = null;
 
     console.log('[RESOLVER] Returning success in ' + (Date.now() - startTime) + 'ms');
     return res.status(200).json({
       statusCode: 200,
       id: fileId,
-      filename: filename || rawFallbackName,
-      size: size || "Unknown",
-      directLink: directLink.replace(/&amp;/g, '&')
+      filename: resolvedData.filename,
+      size: resolvedData.size,
+      directLink: resolvedData.directLink
     });
 
   } catch (err) {
     console.error('[RESOLVER ERR]', err);
-    if (browser) await safeClose(browser);
+    if (browser) fastClose(browser);
     return res.status(500).json({
       statusCode: 500,
       error: err.message
