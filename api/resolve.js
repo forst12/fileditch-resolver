@@ -60,6 +60,14 @@ export default async function handler(req, res) {
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36');
 
+    page.on('console', msg => console.log('[PAGE]', msg.text()));
+    page.on('response', resp => {
+      const u = resp.url();
+      if (u.includes('fileditch') || u.includes('challenge-platform')) {
+        console.log('[HTTP ' + resp.status() + ']', u.slice(0, 70));
+      }
+    });
+
     // Natively block heavy fonts, images, media, and third-party trackers via CDP
     try {
       const cdp = await page.createCDPSession();
@@ -103,6 +111,7 @@ export default async function handler(req, res) {
           const btn = document.querySelector('.btn-main, a[download]');
           const pathEl = document.querySelector('.pathline .path, h1, .filename');
           const sizeEl = document.querySelector('.pathline .size, .filesize');
+          const errEl = document.querySelector('.error-badge');
 
           if (btn && btn.href && btn.href.startsWith('http') && !btn.href.startsWith('javascript:')) {
             return {
