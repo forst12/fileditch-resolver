@@ -8,6 +8,41 @@ puppeteer.use(StealthPlugin());
 
 export const maxDuration = 45;
 
+let cachedBrowser = null;
+
+async function getBrowser() {
+  if (cachedBrowser && cachedBrowser.connected) {
+    try {
+      await cachedBrowser.version();
+      return cachedBrowser;
+    } catch (e) {
+      cachedBrowser = null;
+    }
+  }
+
+  const executablePath = await chromium.executablePath();
+  cachedBrowser = await puppeteer.launch({
+    args: [
+      ...chromium.args,
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--mute-audio',
+      '--no-first-run'
+    ],
+    defaultViewport: { width: 1280, height: 800 },
+    executablePath: executablePath,
+    headless: chromium.headless
+  });
+
+  return cachedBrowser;
+}
+
 export default async function handler(req, res) {
   const startTime = Date.now();
   console.log('[RESOLVER] 1. Request received at', new Date().toISOString());
@@ -20,71 +55,49 @@ export default async function handler(req, res) {
     });
   }
 
-  let browser = null;
-  const safeClose = async (b) => {
-    if (!b) return;
-    try {
-      await Promise.race([b.close(), new Promise(r => setTimeout(r, 1000))]);
-    } catch (e) {}
-    try {
-      if (b.process()) b.process().kill('SIGKILL');
-    } catch (e) {}
-  };
-
+  let page = null;
   try {
     const parsedUrl = new URL(targetUrl);
     const pathSegments = parsedUrl.pathname.split('/').filter(Boolean);
     const fileId = pathSegments.length >= 2 ? pathSegments[pathSegments.length - 2] : (pathSegments[0] || "unknown");
     const rawFallbackName = pathSegments.length > 0 ? decodeURIComponent(pathSegments[pathSegments.length - 1]) : "unknown";
 
-    console.log('[RESOLVER] 2. Extracting chromium executable...');
-    const t0 = Date.now();
-    const executablePath = await chromium.executablePath();
-    console.log('[RESOLVER] 2. Executable ready in ' + (Date.now() - t0) + 'ms:', executablePath);
-
-    console.log('[RESOLVER] 3. Launching stealth browser...');
-    const tLaunch = Date.now();
-    browser = await puppeteer.launch({
-      args: [
-        ...chromium.args,
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled'
-      ],
-      defaultViewport: { width: 1280, height: 800 },
-      executablePath: executablePath,
-      headless: chromium.headless
-    });
-    console.log('[RESOLVER] 3. Browser launched in ' + (Date.now() - tLaunch) + 'ms');
-
-    const page = await browser.newPage();
+    const browser = await getBrowser();
+    page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36');
 
-    // Attach request/response and console diagnostics
-    page.on('console', msg => console.log('[PAGE]', msg.text()));
-    page.on('pageerror', err => console.log('[PAGE ERR]', err.message));
-    page.on('response', resp => {
-      const u = resp.url();
-      if (u.includes('fileditch') || u.includes('challenge-platform')) {
-        console.log('[HTTP ' + resp.status() + ']', u.slice(0, 70));
+    // Intercept and abort unnecessary heavy assets (fonts, images, media, analytics)
+    await page.setRequestInterception(true);
+    page.on('request', (request) => {
+      const resourceType = request.resourceType();
+      const url = request.url();
+      if (
+        resourceType === 'image' ||
+        resourceType === 'media' ||
+        resourceType === 'font' ||
+        url.includes('cloudflareinsights') ||
+        url.includes('llvpn.com')
+      ) {
+        request.abort();
+      } else {
+        request.continue();
       }
     });
 
-    console.log('[RESOLVER] 4. Navigating to ' + targetUrl + '...');
+    console.log('[RESOLVER] 2. Navigating to ' + targetUrl + '...');
     const tNav = Date.now();
     await page.goto(targetUrl, { 
       waitUntil: 'domcontentloaded', 
       timeout: 20000 
     });
-    console.log('[RESOLVER] 4. Navigated in ' + (Date.now() - tNav) + 'ms');
+    console.log('[RESOLVER] 2. Navigated in ' + (Date.now() - tNav) + 'ms');
 
     let directLink = null;
     let filename = null;
     let size = null;
     let errorDetected = null;
 
-    console.log('[RESOLVER] 5. Polling for resolution (max 25s)...');
+    console.log('[RESOLVER] 3. Polling for resolution (100ms interval)...');
     const pollStart = Date.now();
     while (Date.now() - pollStart < 25000) {
       try {
@@ -123,7 +136,7 @@ export default async function handler(req, res) {
       } catch (navErr) {
         // Navigation or context switch in progress; continue polling
       }
-      await new Promise(r => setTimeout(r, 400));
+      await new Promise(r => setTimeout(r, 100));
     }
 
     if (!directLink) {
@@ -138,8 +151,8 @@ export default async function handler(req, res) {
       }).catch(e => ({ title: 'unknown', url: 'unknown', btnHref: 'unknown', text: e.message }));
 
       console.log('[RESOLVER] Failed within timeout. Page state:', JSON.stringify(pageInfo));
-      await safeClose(browser);
-      browser = null;
+      await page.close().catch(() => {});
+      page = null;
 
       return res.status(502).json({
         statusCode: 502,
@@ -147,8 +160,8 @@ export default async function handler(req, res) {
       });
     }
 
-    await safeClose(browser);
-    browser = null;
+    await page.close().catch(() => {});
+    page = null;
 
     console.log('[RESOLVER] Returning success in ' + (Date.now() - startTime) + 'ms');
     return res.status(200).json({
@@ -161,7 +174,13 @@ export default async function handler(req, res) {
 
   } catch (err) {
     console.error('[RESOLVER ERR]', err);
-    if (browser) await safeClose(browser);
+    if (page) {
+      await page.close().catch(() => {});
+      page = null;
+    }
+    if (err.message && (err.message.includes('Target closed') || err.message.includes('Session closed') || err.message.includes('Connection closed'))) {
+      cachedBrowser = null;
+    }
     return res.status(500).json({
       statusCode: 500,
       error: err.message
