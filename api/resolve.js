@@ -8,17 +8,38 @@ puppeteer.use(StealthPlugin());
 
 export const maxDuration = 45;
 
+let cachedExecutablePath = null;
+
 export default async function handler(req, res) {
   const startTime = Date.now();
   console.log('[RESOLVER] 1. Request received at', new Date().toISOString());
 
-  const targetUrl = req.query.link || req.query.url;
-  if (!targetUrl) {
+  const rawUrl = req.query.link || req.query.url;
+  if (!rawUrl) {
     return res.status(400).json({
       statusCode: 400,
       error: "Missing required parameter ?link="
     });
   }
+
+  // 1. Early URL Sanitization and Validation
+  const targetUrl = String(rawUrl).trim().replace(/^["']|["']$/g, '');
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(targetUrl);
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      throw new Error('Protocol must be http or https');
+    }
+  } catch (e) {
+    return res.status(400).json({
+      statusCode: 400,
+      error: "Invalid target URL: " + e.message
+    });
+  }
+
+  const pathSegments = parsedUrl.pathname.split('/').filter(Boolean);
+  const fileId = pathSegments.length >= 2 ? pathSegments[pathSegments.length - 2] : (pathSegments[0] || "");
+  const rawFallbackName = pathSegments.length > 0 ? decodeURIComponent(pathSegments[pathSegments.length - 1]) : "unknown";
 
   let browser = null;
   const fastClose = (b) => {
@@ -33,12 +54,12 @@ export default async function handler(req, res) {
   };
 
   try {
-    const parsedUrl = new URL(targetUrl);
-    const pathSegments = parsedUrl.pathname.split('/').filter(Boolean);
-    const fileId = pathSegments.length >= 2 ? pathSegments[pathSegments.length - 2] : (pathSegments[0] || "unknown");
-    const rawFallbackName = pathSegments.length > 0 ? decodeURIComponent(pathSegments[pathSegments.length - 1]) : "unknown";
+    // 2. Cached Executable Path
+    if (!cachedExecutablePath) {
+      cachedExecutablePath = await chromium.executablePath();
+    }
 
-    const executablePath = await chromium.executablePath();
+    // 3. Optimized Launch & Compact Viewport
     browser = await puppeteer.launch({
       args: [
         ...chromium.args,
@@ -61,8 +82,8 @@ export default async function handler(req, res) {
         '--disable-component-update',
         '--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints'
       ],
-      defaultViewport: { width: 1280, height: 800 },
-      executablePath: executablePath,
+      defaultViewport: { width: 800, height: 600 },
+      executablePath: cachedExecutablePath,
       headless: chromium.headless
     });
 
@@ -73,10 +94,11 @@ export default async function handler(req, res) {
 
     let resolvedData = null;
     let initialTitle = null;
+    let initialNavDone = false;
 
     const parseAndSetResult = (html, source) => {
       if (resolvedData || !html) return false;
-      const b64Match = html.match(/atob\(\s*["'](aHR0cHM6[^"']+)["']\s*\)/);
+      const b64Match = html.match(/atob\(\s*["'](aHR0c[A-Za-z0-9+/=]+)["']\s*\)/i);
       if (!b64Match) return false;
 
       const cleanB64 = b64Match[1].replace(/\\/g, '');
@@ -107,11 +129,14 @@ export default async function handler(req, res) {
       if (u.includes('fileditch') || u.includes('challenge-platform')) {
         console.log('[HTTP ' + resp.status() + ']', u.slice(0, 70));
       }
-      if (!resolvedData && resp.status() === 200 && u.includes(fileId) && resp.request().method() === 'POST') {
-        try {
-          const body = await resp.text();
-          parseAndSetResult(body, 'PUPPETEER_POST');
-        } catch (e) {}
+      if (!resolvedData && resp.status() === 200 && resp.request().method() === 'POST') {
+        const matchesTarget = fileId ? u.includes(fileId) : true;
+        if (matchesTarget) {
+          try {
+            const body = await resp.text();
+            parseAndSetResult(body, 'PUPPETEER_POST');
+          } catch (e) {}
+        }
       }
     });
 
@@ -148,13 +173,16 @@ export default async function handler(req, res) {
       });
 
       cdp.on('Network.responseReceived', async (params) => {
-        const { response, requestId } = params;
-        if (!resolvedData && response.status === 200 && response.url.includes(fileId)) {
-          try {
-            const res = await cdp.send('Network.getResponseBody', { requestId });
-            const html = res.base64Encoded ? Buffer.from(res.body, 'base64').toString('utf8') : res.body;
-            if (html) parseAndSetResult(html, 'CDP_RESPONSE');
-          } catch (e) {}
+        if (initialNavDone && !resolvedData && params.response.status === 200 && params.type === 'Document') {
+          const u = params.response.url;
+          const matchesTarget = fileId ? u.includes(fileId) : true;
+          if (matchesTarget) {
+            try {
+              const res = await cdp.send('Network.getResponseBody', { requestId: params.requestId });
+              const html = res.base64Encoded ? Buffer.from(res.body, 'base64').toString('utf8') : res.body;
+              if (html) parseAndSetResult(html, 'CDP_RESPONSE');
+            } catch (e) {}
+          }
         }
       });
     } catch (e) {
@@ -163,21 +191,49 @@ export default async function handler(req, res) {
 
     console.log('[RESOLVER] 2. Navigating to ' + targetUrl + '...');
     const tNav = Date.now();
-    await page.goto(targetUrl, { 
+    const navResp = await page.goto(targetUrl, { 
       waitUntil: 'domcontentloaded', 
       timeout: 20000 
     });
+    initialNavDone = true;
     console.log('[RESOLVER] 2. Navigated in ' + (Date.now() - tNav) + 'ms');
 
+    // Fast check for HTTP 404 from host
+    if (navResp && navResp.status() === 404) {
+      fastClose(browser);
+      return res.status(404).json({
+        statusCode: 404,
+        error: "File not found (HTTP 404 from host)"
+      });
+    }
+
+    // Fast check for missing/deleted file or title
     try {
-      const t = await page.title();
-      if (t && !t.includes('FileDitch') && !t.includes('Just a moment')) {
-        initialTitle = t.trim();
+      const pageMeta = await page.evaluate(() => {
+        const goneEl = document.querySelector('.gone, .error-404');
+        const notFoundText = document.body && (document.body.innerText.includes('File Not Found') || document.body.innerText.includes('File gone'));
+        return {
+          title: document.title,
+          isGone: !!(goneEl || notFoundText)
+        };
+      });
+
+      if (pageMeta.isGone) {
+        console.log('[RESOLVER] Detected missing/deleted file in ' + (Date.now() - startTime) + 'ms');
+        fastClose(browser);
+        return res.status(404).json({
+          statusCode: 404,
+          error: "File not found or deleted on FileDitch"
+        });
+      }
+
+      if (pageMeta.title && !pageMeta.title.includes('FileDitch') && !pageMeta.title.includes('Just a moment')) {
+        initialTitle = pageMeta.title.trim();
       }
     } catch (e) {}
 
     // Safe evaluate helper
-    const evalWithTimeout = (fn, timeoutMs = 1200) => {
+    const evalWithTimeout = (fn, timeoutMs = 1000) => {
       return Promise.race([
         page.evaluate(fn),
         new Promise((_, reject) => setTimeout(() => reject(new Error('eval_timeout')), timeoutMs))
@@ -197,6 +253,11 @@ export default async function handler(req, res) {
           const pathEl = document.querySelector('.pathline .path, h1, .filename');
           const sizeEl = document.querySelector('.pathline .size, .filesize');
           const errEl = document.querySelector('.error-badge');
+          const goneEl = document.querySelector('.gone');
+
+          if (goneEl) {
+            return { isGone: true };
+          }
 
           if (btn && btn.href && btn.href.startsWith('http') && !btn.href.startsWith('javascript:')) {
             return {
@@ -211,7 +272,15 @@ export default async function handler(req, res) {
           }
 
           return null;
-        }, 1000);
+        }, 800);
+
+        if (data && data.isGone) {
+          fastClose(browser);
+          return res.status(404).json({
+            statusCode: 404,
+            error: "File not found or deleted on FileDitch"
+          });
+        }
 
         if (data && data.directLink) {
           resolvedData = {
@@ -228,7 +297,7 @@ export default async function handler(req, res) {
         }
       } catch (navErr) {}
 
-      await new Promise(r => setTimeout(r, 60));
+      await new Promise(r => setTimeout(r, 50));
     }
 
     if (!resolvedData) {
@@ -240,7 +309,7 @@ export default async function handler(req, res) {
           btnHref: btn ? btn.href : 'no btn',
           text: document.body ? document.body.innerText.slice(0, 300) : ''
         };
-      }, 1500).catch(e => ({ title: 'unknown', url: 'unknown', btnHref: 'unknown', text: e.message }));
+      }, 1200).catch(e => ({ title: 'unknown', url: 'unknown', btnHref: 'unknown', text: e.message }));
 
       console.log('[RESOLVER] Failed within timeout. Page state:', JSON.stringify(pageInfo), 'Last badge:', lastErrorBadge);
       fastClose(browser);
